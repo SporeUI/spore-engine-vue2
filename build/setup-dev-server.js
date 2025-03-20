@@ -1,0 +1,187 @@
+const $fse = require('fs-extra');
+const $path = require('path');
+const $lodash = require('lodash');
+const $MFS = require('memory-fs');
+const webpack = require('webpack');
+const chokidar = require('chokidar');
+const $koaWebpackDevMiddleware = require('koa-webpack-dev-middleware');
+const $koaWebpackHotMiddleware = require('koa-webpack-hot-middleware');
+const clientConfig = require('./webpack.client.config');
+const serverConfig = require('./webpack.server.config');
+const $logger = require('../server/service/logger');
+
+const readFile = (vfs, file) => {
+  try {
+    return vfs.readFileSync(
+      $path.join(clientConfig.output.path, file),
+      'utf-8',
+    );
+  } catch (e) {}
+};
+
+// 配置参考
+// https://github.com/vuejs/vue-hackernews-2.0/
+// https://github.com/lentoo/vue-cli-ssr-example
+
+const setupDevServer = function (app, options) {
+  const conf = {
+    context: app.$resolve('./'),
+    templatePath: '',
+    onUpdate: $lodash.noop,
+    inputFileSystem: null,
+    ...options,
+  };
+
+  const distDir = app.$resolve('./dist');
+  const tempDir = app.$resolve('./temp');
+  const clientFile = 'vue-ssr-client-manifest.json';
+  const serverFile = 'vue-ssr-server-bundle.json';
+  const writeTemp = $lodash.get(app, 'config.writeTemp');
+
+  $logger.info('webpack.context:', conf.context);
+  $logger.info('webpack.output.path:', distDir);
+
+  const vueConfigPath = app.$resolve('vue.config.js');
+  $logger.info('vue.config file:', vueConfigPath);
+  let vueConfig = {};
+  if ($fse.existsSync(vueConfigPath)) {
+    vueConfig = require(vueConfigPath) || {};
+  }
+  const webpackHook = $lodash.get(vueConfig, 'configureWebpack');
+
+  const mergeWebpackConfig = (spec) => {
+    const wconf = spec;
+    wconf.context = conf.context;
+    wconf.output.path = distDir;
+  };
+
+  const {
+    templatePath,
+  } = conf;
+
+  let bundle;
+  let template;
+  let clientManifest;
+  let clientCompiler = null;
+  let serverCompiler = null;
+
+  const update = () => {
+    if (bundle && clientManifest) {
+      conf.onUpdate({
+        bundle,
+        template,
+        clientManifest,
+      });
+    }
+  };
+
+  // read template from disk and watch
+  template = $fse.readFileSync(templatePath, 'utf-8');
+  chokidar.watch(templatePath).on('change', () => {
+    template = $fse.readFileSync(templatePath, 'utf-8');
+    $logger.log('index.html template updated.');
+    update();
+  });
+
+  // 配置 client 入口文件
+  const entryClient = $lodash.get(app, 'config.entryClient');
+  clientConfig.entry.app = entryClient;
+
+  // modify client config to work with hot middleware
+  clientConfig.entry.app = [
+    'webpack-hot-middleware/client',
+    clientConfig.entry.app,
+  ];
+  clientConfig.output.filename = '[name].js';
+  clientConfig.plugins.push(
+    new webpack.optimize.OccurrenceOrderPlugin(),
+    new webpack.HotModuleReplacementPlugin(),
+    new webpack.NoEmitOnErrorsPlugin(),
+  );
+
+  // dev middleware
+  mergeWebpackConfig(clientConfig);
+  if (typeof webpackHook === 'function') {
+    webpackHook(clientConfig, 'client');
+  }
+
+  clientCompiler = webpack(clientConfig);
+  $logger.log('clientCompiler created');
+
+  if (conf.inputFileSystem) {
+    clientCompiler.inputFileSystem = conf.inputFileSystem;
+  }
+
+  const devMiddleware = $koaWebpackDevMiddleware(clientCompiler, {
+    publicPath: clientConfig.output.publicPath,
+    noInfo: true,
+  });
+  app.use(devMiddleware);
+  $logger.log('devMiddleware injected');
+
+  clientCompiler.plugin('done', (statsInfo) => {
+    $logger.log('clientCompiler done');
+    const stats = statsInfo.toJson();
+    stats.errors.forEach(err => $logger.error(err));
+    stats.warnings.forEach(err => $logger.warn(err));
+    if (stats.errors.length) return;
+    clientManifest = JSON.parse(readFile(
+      devMiddleware.fileSystem,
+      clientFile,
+    ));
+    if (writeTemp) {
+      const tempClientFile = $path.join(tempDir, clientFile);
+      $fse.ensureFileSync(tempClientFile);
+      $fse.writeJSON(tempClientFile, clientManifest);
+    }
+    update();
+  });
+
+  // hot middleware
+  app.use($koaWebpackHotMiddleware(
+    clientCompiler,
+    { heartbeat: 5000 },
+  ));
+
+  // 配置 server 入口文件
+  const entryServer = $lodash.get(app, 'config.entryServer');
+  serverConfig.entry.app = entryServer;
+
+  mergeWebpackConfig(serverConfig);
+  // watch and update server renderer
+  if (typeof webpackHook === 'function') {
+    webpackHook(serverConfig, 'server');
+  }
+
+  serverCompiler = webpack(serverConfig);
+  $logger.log('serverCompiler created');
+
+  const mfs = new $MFS();
+  if (conf.inputFileSystem) {
+    serverCompiler.inputFileSystem = conf.inputFileSystem;
+  }
+  serverCompiler.outputFileSystem = mfs;
+  serverCompiler.watch({}, (err, statsInfo) => {
+    if (err) throw err;
+    const stats = statsInfo.toJson();
+    $logger.log('serverCompiler stats.errors.length:', stats.errors.length);
+    if (stats.errors.length) return;
+
+    // read bundle generated by vue-ssr-webpack-plugin
+    bundle = JSON.parse(readFile(mfs, serverFile));
+    if (writeTemp) {
+      // 记录 ssr bundle 以便查看调试代码
+      const tempServerFile = $path.join(tempDir, serverFile);
+      $fse.ensureFileSync(tempServerFile);
+      $fse.writeJSON(tempServerFile, bundle);
+    }
+    update();
+  });
+
+  return {
+    clientCompiler,
+    serverCompiler,
+  };
+};
+
+module.exports = setupDevServer;
